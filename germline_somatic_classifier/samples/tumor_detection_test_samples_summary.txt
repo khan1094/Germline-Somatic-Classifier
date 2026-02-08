@@ -1,0 +1,61 @@
+TUMOR DETECTION TEST SAMPLES SUMMARY
+=====================================
+Generated: $(date +%Y-%m-%d)
+
+CONTENTS
+--------
+18 somatic samples with Mutect2 VCF outputs and tabix indices.
+Total size: 13 MB (compressed)
+
+SAMPLE BREAKDOWN BY CATEGORY
+----------------------------
+
+Sample                  Total     PASS       Type      Assay
+-------------------- -------- -------- ---------- ----------
+CO8-MA-27                2671     1938      Tumor      Panel
+CO8-MA-35                2911     2102      Tumor      Panel
+CO8-MA-exome            28563    24669      Tumor      Exome
+CO8-MD-10                2709     1949      Tumor      Panel
+CO8-MD-5                 2058     1437      Tumor      Panel
+CO8-MD-exome            29385    25536      Tumor      Exome
+CO8-NC-exome            30193    26145    Control      Exome
+CO8-NC-pop               3166     2223    Control      Panel
+CO8-NL-exome            29431    25771    Control      Exome
+CO8-NL-pop               3064     2347    Control      Panel
+CO8-PA-26                2760     1930      Tumor      Panel
+CO8-PA-65                2962     2119      Tumor      Panel
+CO8-PA-exome            28568    24826      Tumor      Exome
+CO8-PD-16                3149     2142      Tumor      Panel
+CO8-PD-17                2771     1850      Tumor      Panel
+CO8-PDD-18               3054     2043      Tumor      Panel
+CO8-PDD-47               2992     1935      Tumor      Panel
+CO8-PD-exome            30017    26059      Tumor      Exome
+
+CATEGORY LEGEND
+---------------
+PA  = Primary tumor type A
+PD  = Primary tumor type D
+PDD = Primary tumor type DD
+MA  = Metastatic tumor type A
+MD  = Metastatic tumor type D
+NC  = Negative Control
+NL  = Normal
+
+ASSAY TYPES
+-----------
+Panel: Targeted gene panel (~2,000-3,000 variants)
+Exome: Whole exome sequencing (~25,000-30,000 variants)
+
+FILE FORMAT
+-----------
+- *_mutect2_vlod.vcf.gz     : Mutect2 somatic variant calls (bgzipped VCF)
+- *_mutect2_vlod.vcf.gz.tbi : Tabix index
+
+SAMPLE COUNTS
+-------------
+Tumor (Exome):   4
+Tumor (Panel):   10
+Control (Exome): 2
+Control (Panel): 2
+-----------------------
+Total:           18
