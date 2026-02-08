@@ -222,9 +222,5 @@ def main():
 
     print(f"Done. Output written to: {args.output}")
 
-####################################
-# Entry point
-####################################
-
 if __name__ == "__main__":
     main()
