@@ -117,11 +117,6 @@ def classify_variant(
         return "CONFLICTING"
     return "UNKNOWN"
 
-
-####################################
-# Main
-####################################
-
 def main():
     parser = argparse.ArgumentParser(
         description="Somatic Variant Classifier using gnomAD and COSMIC"
