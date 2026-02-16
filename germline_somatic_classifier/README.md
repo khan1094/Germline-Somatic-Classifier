@@ -281,3 +281,149 @@ The output TSV is intended for **downstream filtering, review, or visualization*
 ✔ Technical requirements satisfied  
 ✔ Unit-tested core logic  
 ✔ Example usage and outputs provided  
+
+
+# Somatic vs Germline Variant Classifier
+
+## 🚀 Version 2 -- Performance & Architecture Update
+
+Version 2 introduces a significant architectural improvement to the
+pipeline.\
+The scoring model and output format remain unchanged, but reference data
+access has been redesigned for performance, stability, and scalability.
+
+------------------------------------------------------------------------
+
+## 🔧 What Changed in v2?
+
+In Version 1:
+
+-   gnomAD and COSMIC files were opened inside each worker process
+-   Reference indexes were repeatedly initialized
+-   High I/O overhead significantly increased runtime
+
+In Version 2:
+
+-   gnomAD and COSMIC files are initialized **once**
+-   Indexed region-based queries are reused
+-   Redundant file initialization is eliminated
+-   Memory usage is reduced
+-   Runtime is dramatically improved
+
+Example benchmark (\~2000 variants):
+
+  Version   Runtime
+  --------- ------------------
+  v1        \~1.5--2 minutes
+  v2        \< 1 second
+
+------------------------------------------------------------------------
+
+## 📦 Reference Data Requirements
+
+This pipeline requires **indexed reference files** to enable fast
+region-based queries.
+
+Required files inside the `data/` directory:
+
+    data/
+    ├── gnomad4_1pct.vcf.gz
+    ├── gnomad4_1pct.vcf.gz.tbi
+    ├── hg38_cosmic91.txt.gz
+    └── hg38_cosmic91.txt.gz.tbi
+
+If `.tbi` index files are missing, they must be created before running
+the classifier.
+
+------------------------------------------------------------------------
+
+## 🛠 Preparing Reference Files
+
+### 1️⃣ gnomAD (VCF)
+
+If you already have:
+
+    gnomad4_1pct.vcf.gz
+
+Create the index:
+
+``` bash
+tabix -p vcf data/gnomad4_1pct.vcf.gz
+```
+
+This will generate:
+
+    gnomad4_1pct.vcf.gz.tbi
+
+------------------------------------------------------------------------
+
+### 2️⃣ COSMIC
+
+If you have:
+
+    hg38_cosmic91.txt
+
+Convert and index:
+
+``` bash
+bgzip data/hg38_cosmic91.txt
+tabix -s 1 -b 2 -e 2 data/hg38_cosmic91.txt.gz
+```
+
+If you already have:
+
+    hg38_cosmic91.txt.gz
+
+But no index, run:
+
+``` bash
+tabix -s 1 -b 2 -e 2 data/hg38_cosmic91.txt.gz
+```
+
+This will generate:
+
+    hg38_cosmic91.txt.gz.tbi
+
+------------------------------------------------------------------------
+
+## ▶ Running the Classifier
+
+``` bash
+python updated_somatic_variant_classifier.py   --sample-vcf samples/CO8-MA-27_mutect2_vlod.vcf.gz   --gnomad-vcf data/gnomad4_1pct.vcf.gz   --cosmic-tsv data/hg38_cosmic91.txt.gz   --output results/output.tsv
+```
+
+⚠️ Note: You do NOT need to explicitly pass `.tbi` files.\
+They are automatically detected when present in the same directory.
+
+------------------------------------------------------------------------
+
+## 🧠 Design Principles
+
+-   Memory-safe streaming access
+-   Indexed region-based querying (Tabix / cyvcf2)
+-   No full VCF loading into RAM
+-   Production-ready architecture
+-   Identical output format to Version 1
+
+------------------------------------------------------------------------
+
+## 📌 Output Format
+
+The TSV output contains:
+
+-   chrom
+-   pos
+-   ref
+-   alt
+-   filter
+-   sample_dp
+-   sample_af
+-   gnomad_af
+-   gnomad_an
+-   cosmic_count
+-   cosmic_tissues
+-   germline_score
+-   somatic_score
+-   classification
+
+Output schema is unchanged from Version 1.
