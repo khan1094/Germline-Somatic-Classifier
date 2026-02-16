@@ -1,21 +1,40 @@
 #!/usr/bin/env python3
 
 import argparse
-import gzip
 import math
 import os
-import re
 import sys
 import csv
-from collections import defaultdict
+from multiprocessing import Pool, cpu_count
 from cyvcf2 import VCF
+import pysam
+import re
+import warnings
+import time
+
+warnings.filterwarnings("ignore", message="no intervals found")
 
 ####################################
-# Utility functions
+# Globals (worker-level single load)
 ####################################
 
-def normalize_chrom(chrom: str) -> str:
+GNOMAD = None
+COSMIC = None
+CONFIG = None
+
+####################################
+# Chromosome Normalization
+####################################
+
+def strip_chr(chrom: str) -> str:
     return chrom.replace("chr", "")
+
+def add_chr(chrom: str) -> str:
+    return chrom if chrom.startswith("chr") else "chr" + chrom
+
+####################################
+# Scoring
+####################################
 
 def compute_germline_score(af, an, an_threshold):
     if af is None or an is None:
@@ -29,193 +48,240 @@ def compute_somatic_score(cosmic_count):
     return math.log10(cosmic_count + 1)
 
 ####################################
-# Load gnomAD
+# Reference Data Access
 ####################################
 
-def load_gnomad(gnomad_vcf_path):
-    if not os.path.exists(gnomad_vcf_path):
-        sys.exit(f"ERROR: gnomAD VCF not found: {gnomad_vcf_path}")
+class GnomadAccessor:
+    def __init__(self, path):
+        self.vcf = VCF(path)
+        first_contig = next(iter(self.vcf.seqnames))
+        self.has_chr = first_contig.startswith("chr")
 
-    gnomad = {}
-    vcf = VCF(gnomad_vcf_path)
+    def normalize(self, chrom):
+        chrom = strip_chr(chrom)
+        return add_chr(chrom) if self.has_chr else chrom
 
-    for var in vcf:
-        chrom = normalize_chrom(var.CHROM)
-        pos = var.POS
-        ref = var.REF
+    def query(self, chrom, pos, ref, alt):
+        for var in self.vcf(f"{self.normalize(chrom)}:{pos}-{pos}"):
 
-        af = var.INFO.get("AF")
-        an = var.INFO.get("AN")
+            if strip_chr(var.CHROM) != strip_chr(chrom):
+                continue
 
-        if isinstance(af, (list, tuple)):
-            af = af[0]
+            if var.REF != ref:
+                continue
 
-        for alt in var.ALT:
-            key = (chrom, pos, ref, alt)
-            gnomad[key] = {"af": af, "an": an}
+            for i, allele in enumerate(var.ALT):
+                if allele == alt:
+                    af = var.INFO.get("AF")
+                    an = var.INFO.get("AN")
+                    if isinstance(af, (list, tuple)):
+                        af = af[i]
+                    return af, an
 
-    return gnomad
+        return None, None
 
-####################################
-# Load COSMIC
-####################################
 
-def load_cosmic(cosmic_path):
-    if not os.path.exists(cosmic_path):
-        sys.exit(f"ERROR: COSMIC file not found: {cosmic_path}")
+class CosmicAccessor:
+    def __init__(self, path):
+        self.tabix = pysam.TabixFile(path)
 
-    cosmic = defaultdict(lambda: {"count": 0, "tissues": set()})
+    def query(self, chrom, pos, ref, alt):
+        try:
+            records = self.tabix.fetch(add_chr(strip_chr(chrom)), pos-1, pos)
+        except Exception:
+            try:
+                records = self.tabix.fetch(strip_chr(chrom), pos-1, pos)
+            except Exception:
+                return None, ""
 
-    with gzip.open(cosmic_path, "rt") as f:
-        for line in f:
+        total = 0
+        tissues = set()
+
+        for line in records:
             parts = line.strip().split("\t")
             if len(parts) < 6:
                 continue
 
-            chrom = normalize_chrom(parts[0])
-            start = int(parts[1])
-            ref = parts[3]
-            alt = parts[4]
-            info = parts[5]
+            if (strip_chr(parts[0]) == strip_chr(chrom) and
+                int(parts[1]) == pos and
+                parts[3] == ref and
+                parts[4] == alt):
 
-            matches = re.findall(r"(\d+)\(([^)]+)\)", info)
-            total = 0
-            tissues = set()
+                matches = re.findall(r"(\d+)\(([^)]+)\)", parts[5])
+                for count, tissue in matches:
+                    total += int(count)
+                    tissues.add(tissue)
 
-            for c, t in matches:
-                total += int(c)
-                tissues.add(t)
+        if total == 0:
+            return None, ""
 
-            key = (chrom, start, ref, alt)
-            cosmic[key]["count"] += total
-            cosmic[key]["tissues"].update(tissues)
-
-    return cosmic
-
+        return total, ",".join(sorted(tissues))
 
 ####################################
-# Classify Variant
+# Worker Initializer (LOAD ONCE)
 ####################################
 
-def classify_variant(
-    germline_score,
-    somatic_score,
-    germline_threshold,
-    somatic_threshold
-):
-    """
-    Classification matrix based on task specification.
-    """
-    g_high = germline_score >= germline_threshold
-    s_high = somatic_score >= somatic_threshold
+def init_worker(gnomad_path, cosmic_path, config):
+    global GNOMAD, COSMIC, CONFIG
+    GNOMAD = GnomadAccessor(gnomad_path)
+    COSMIC = CosmicAccessor(cosmic_path)
+    CONFIG = config
 
-    if g_high and not s_high:
+####################################
+# Worker Function
+####################################
+
+def process_variant(var_dict):
+
+    chrom = var_dict["chrom"]
+    pos = var_dict["pos"]
+    ref = var_dict["ref"]
+    alt = var_dict["alt"]
+
+    g_af, g_an = GNOMAD.query(chrom, pos, ref, alt)
+    c_count, c_tissues = COSMIC.query(chrom, pos, ref, alt)
+
+    g_score = compute_germline_score(g_af, g_an, CONFIG["an_threshold"])
+    s_score = compute_somatic_score(c_count)
+
+    classification = classify_variant(
+        g_score, s_score,
+        CONFIG["g_thr"],
+        CONFIG["s_thr"]
+    )
+
+    var_dict.update({
+        "gnomad_af": g_af if g_af is not None else "",
+        "gnomad_an": g_an if g_an is not None else "",
+        "cosmic_count": c_count if c_count is not None else "",
+        "cosmic_tissues": c_tissues,
+        "germline_score": round(g_score, 4),
+        "somatic_score": round(s_score, 4),
+        "classification": classification
+    })
+
+    return var_dict
+
+####################################
+# Classification
+####################################
+
+def classify_variant(g_score, s_score, g_thr, s_thr):
+    if g_score >= g_thr and s_score < s_thr:
         return "LIKELY_GERMLINE"
-    if not g_high and s_high:
+    if g_score < g_thr and s_score >= s_thr:
         return "LIKELY_SOMATIC"
-    if g_high and s_high:
+    if g_score >= g_thr and s_score >= s_thr:
         return "CONFLICTING"
     return "UNKNOWN"
 
+####################################
+# Main
+####################################
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Somatic Variant Classifier using gnomAD and COSMIC"
-    )
 
-    parser.add_argument("--sample-vcf", required=True, help="Mutect2 VCF file")
-    parser.add_argument("--gnomad-vcf", required=True, help="gnomAD reference VCF")
-    parser.add_argument("--cosmic-tsv", required=True, help="COSMIC TSV (gzipped)")
-    parser.add_argument("--output", required=True, help="Output TSV file")
+    print("\n========================================")
+    print("   Somatic vs Germline Variant Classifier")
+    print("========================================\n")
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sample-vcf", required=True)
+    parser.add_argument("--gnomad-vcf", required=True)
+    parser.add_argument("--cosmic-tsv", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--threads", type=int, default=cpu_count())
     parser.add_argument("--germline-threshold", type=float, default=0.1)
     parser.add_argument("--somatic-threshold", type=float, default=1.0)
     parser.add_argument("--an-confidence-threshold", type=int, default=100000)
 
     args = parser.parse_args()
 
-    if not os.path.exists(args.sample_vcf):
-        sys.exit(f"ERROR: Sample VCF not found: {args.sample_vcf}")
+    print("[INPUT]")
+    print(f" Sample VCF : {args.sample_vcf}")
+    print(f" gnomAD VCF : {args.gnomad_vcf}")
+    print(f" COSMIC TSV : {args.cosmic_tsv}")
+    print(f" Output     : {args.output}")
+    print(f" Threads    : {args.threads}\n")
 
-    print("Loading gnomAD...")
-    gnomad = load_gnomad(args.gnomad_vcf)
-
-    print("Loading COSMIC...")
-    cosmic = load_cosmic(args.cosmic_tsv)
-
-    print("Processing sample VCF...")
-    sample_vcf = VCF(args.sample_vcf)
-
-    output_fields = [
-        "chrom",
-        "pos",
-        "ref",
-        "alt",
-        "filter",
-        "sample_dp",
-        "sample_af",
-        "gnomad_af",
-        "gnomad_an",
-        "cosmic_count",
-        "cosmic_tissues",
-        "germline_score",
-        "somatic_score",
-        "classification",
-    ]
+    config = {
+        "g_thr": args.germline_threshold,
+        "s_thr": args.somatic_threshold,
+        "an_threshold": args.an_confidence_threshold
+    }
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
+    sample_vcf = VCF(args.sample_vcf)
+
     with open(args.output, "w", newline="") as out_f:
-        writer = csv.DictWriter(out_f, fieldnames=output_fields, delimiter="\t")
+
+        fieldnames = [
+            "chrom","pos","ref","alt",
+            "filter","sample_dp","sample_af",
+            "gnomad_af","gnomad_an",
+            "cosmic_count","cosmic_tissues",
+            "germline_score","somatic_score",
+            "classification"
+        ]
+
+        writer = csv.DictWriter(out_f, fieldnames=fieldnames, delimiter="\t")
         writer.writeheader()
 
+        jobs = []
+
+        print("[INFO] Preparing variants...")
+
         for var in sample_vcf:
-            dp = var.format("DP")[0][0] if var.format("DP") is not None else None
-            af = var.format("AF")[0][0] if var.format("AF") is not None else None
+
+            filter_status = var.FILTER if var.FILTER not in (None, "PASS", ".") else ""
+
+            dp = var.format("DP")
+            af = var.format("AF")
+            ad = var.format("AD")
+
+            sample_dp = dp[0][0] if dp is not None else ""
+
+            sample_af = ""
+            if af is not None:
+                sample_af = af[0][0]
+            elif ad is not None and len(ad[0]) > 1:
+                ref_count = ad[0][0]
+                alt_count = ad[0][1]
+                total = ref_count + alt_count
+                if total > 0:
+                    sample_af = alt_count / total
 
             for alt in var.ALT:
-                chrom = normalize_chrom(var.CHROM)
-                pos = var.POS
-                ref = var.REF
-
-                key = (chrom, pos, ref, alt)
-
-                g = gnomad.get(key)
-                c = cosmic.get(key)
-
-                g_af = g["af"] if g else None
-                g_an = g["an"] if g else None
-                c_count = c["count"] if c else None
-                c_tissues = ",".join(sorted(c["tissues"])) if c else ""
-
-                germline_score = compute_germline_score(
-                    g_af, g_an, args.an_confidence_threshold
-                )
-                somatic_score = compute_somatic_score(c_count)
-
-                classification = classify_variant(
-                    germline_score,
-                    somatic_score,
-                    args.germline_threshold,
-                    args.somatic_threshold)
-
-                writer.writerow({
-                    "chrom": chrom,
-                    "pos": pos,
-                    "ref": ref,
+                jobs.append({
+                    "chrom": strip_chr(var.CHROM),
+                    "pos": var.POS,
+                    "ref": var.REF,
                     "alt": alt,
-                    "filter": var.FILTER,
-                    "sample_dp": dp if dp is not None else "",
-                    "sample_af": af if af is not None else "",
-                    "gnomad_af": g_af if g_af is not None else "",
-                    "gnomad_an": g_an if g_an is not None else "",
-                    "cosmic_count": c_count if c_count is not None else "",
-                    "cosmic_tissues": c_tissues,
-                    "germline_score": round(germline_score, 4),
-                    "somatic_score": round(somatic_score, 4),
-                    "classification": classification,
+                    "filter": filter_status,
+                    "sample_dp": sample_dp,
+                    "sample_af": sample_af
                 })
 
-    print(f"Done. Output written to: {args.output}")
+        print(f"[INFO] Total variants: {len(jobs)}")
+        print("[INFO] Starting classification...\n")
+
+        start = time.time()
+
+        with Pool(args.threads, initializer=init_worker,
+                  initargs=(args.gnomad_vcf, args.cosmic_tsv, config)) as pool:
+
+            for result in pool.imap(process_variant, jobs, chunksize=200):
+                writer.writerow(result)
+
+        elapsed = round(time.time() - start, 2)
+
+    print("\n========================================")
+    print("Completed successfully.")
+    print(f"Output written to: {args.output}")
+    print(f"Elapsed time: {elapsed} seconds")
+    print("========================================\n")
+
 
 if __name__ == "__main__":
     main()
