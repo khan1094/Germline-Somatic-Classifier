@@ -143,6 +143,13 @@ Install:
 pip install -r requirements.txt
 ```
 
+tabix / bgzip (htslib):
+
+``` bash
+apt-get update
+apt-get install -y tabix
+```
+
 ------------------------------------------------------------------------
 
 # Reference File Preparation
