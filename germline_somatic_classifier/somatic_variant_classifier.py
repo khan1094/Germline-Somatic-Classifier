@@ -14,13 +14,18 @@ import time
 
 warnings.filterwarnings("ignore", message="no intervals found")
 
-####################################
-# Globals (worker-level single load)
-####################################
-
 GNOMAD = None
 COSMIC = None
 CONFIG = None
+
+
+####################################
+# Utility Logging (stderr only)
+####################################
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
 
 ####################################
 # Chromosome Normalization
@@ -31,6 +36,7 @@ def strip_chr(chrom: str) -> str:
 
 def add_chr(chrom: str) -> str:
     return chrom if chrom.startswith("chr") else "chr" + chrom
+
 
 ####################################
 # Scoring
@@ -47,8 +53,9 @@ def compute_somatic_score(cosmic_count):
         return 0.0
     return math.log10(cosmic_count + 1)
 
+
 ####################################
-# Reference Data Access
+# Reference Accessors
 ####################################
 
 class GnomadAccessor:
@@ -66,7 +73,6 @@ class GnomadAccessor:
 
             if strip_chr(var.CHROM) != strip_chr(chrom):
                 continue
-
             if var.REF != ref:
                 continue
 
@@ -117,8 +123,9 @@ class CosmicAccessor:
 
         return total, ",".join(sorted(tissues))
 
+
 ####################################
-# Worker Initializer (LOAD ONCE)
+# Worker Init
 ####################################
 
 def init_worker(gnomad_path, cosmic_path, config):
@@ -127,9 +134,20 @@ def init_worker(gnomad_path, cosmic_path, config):
     COSMIC = CosmicAccessor(cosmic_path)
     CONFIG = config
 
+
 ####################################
-# Worker Function
+# Classification
 ####################################
+
+def classify_variant(g_score, s_score, g_thr, s_thr):
+    if g_score >= g_thr and s_score < s_thr:
+        return "LIKELY_GERMLINE"
+    if g_score < g_thr and s_score >= s_thr:
+        return "LIKELY_SOMATIC"
+    if g_score >= g_thr and s_score >= s_thr:
+        return "CONFLICTING"
+    return "UNKNOWN"
+
 
 def process_variant(var_dict):
 
@@ -162,125 +180,101 @@ def process_variant(var_dict):
 
     return var_dict
 
-####################################
-# Classification
-####################################
-
-def classify_variant(g_score, s_score, g_thr, s_thr):
-    if g_score >= g_thr and s_score < s_thr:
-        return "LIKELY_GERMLINE"
-    if g_score < g_thr and s_score >= s_thr:
-        return "LIKELY_SOMATIC"
-    if g_score >= g_thr and s_score >= s_thr:
-        return "CONFLICTING"
-    return "UNKNOWN"
 
 ####################################
 # Main
 ####################################
 
 def main():
+    try:
 
-    print("\n========================================")
-    print("   Somatic vs Germline Variant Classifier")
-    print("========================================\n")
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--sample-vcf", required=True)
+        parser.add_argument("--gnomad-vcf", required=True)
+        parser.add_argument("--cosmic-tsv", required=True)
+        parser.add_argument("--output", required=True)
+        parser.add_argument("--threads", type=int, default=cpu_count())
+        parser.add_argument("--germline-threshold", type=float, default=0.1)
+        parser.add_argument("--somatic-threshold", type=float, default=1.0)
+        parser.add_argument("--an-confidence-threshold", type=int, default=100000)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sample-vcf", required=True)
-    parser.add_argument("--gnomad-vcf", required=True)
-    parser.add_argument("--cosmic-tsv", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--threads", type=int, default=cpu_count())
-    parser.add_argument("--germline-threshold", type=float, default=0.1)
-    parser.add_argument("--somatic-threshold", type=float, default=1.0)
-    parser.add_argument("--an-confidence-threshold", type=int, default=100000)
+        args = parser.parse_args()
 
-    args = parser.parse_args()
+        log("Starting Somatic vs Germline Variant Classifier")
 
-    print("[INPUT]")
-    print(f" Sample VCF : {args.sample_vcf}")
-    print(f" gnomAD VCF : {args.gnomad_vcf}")
-    print(f" COSMIC TSV : {args.cosmic_tsv}")
-    print(f" Output     : {args.output}")
-    print(f" Threads    : {args.threads}\n")
+        config = {
+            "g_thr": args.germline_threshold,
+            "s_thr": args.somatic_threshold,
+            "an_threshold": args.an_confidence_threshold
+        }
 
-    config = {
-        "g_thr": args.germline_threshold,
-        "s_thr": args.somatic_threshold,
-        "an_threshold": args.an_confidence_threshold
-    }
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        sample_vcf = VCF(args.sample_vcf)
 
-    sample_vcf = VCF(args.sample_vcf)
+        with open(args.output, "w", newline="") as out_f:
 
-    with open(args.output, "w", newline="") as out_f:
+            fieldnames = [
+                "chrom","pos","ref","alt",
+                "filter","sample_dp","sample_af",
+                "gnomad_af","gnomad_an",
+                "cosmic_count","cosmic_tissues",
+                "germline_score","somatic_score",
+                "classification"
+            ]
 
-        fieldnames = [
-            "chrom","pos","ref","alt",
-            "filter","sample_dp","sample_af",
-            "gnomad_af","gnomad_an",
-            "cosmic_count","cosmic_tissues",
-            "germline_score","somatic_score",
-            "classification"
-        ]
+            writer = csv.DictWriter(out_f, fieldnames=fieldnames, delimiter="\t")
+            writer.writeheader()
 
-        writer = csv.DictWriter(out_f, fieldnames=fieldnames, delimiter="\t")
-        writer.writeheader()
+            jobs = []
 
-        jobs = []
+            for var in sample_vcf:
 
-        print("[INFO] Preparing variants...")
+                filter_status = var.FILTER if var.FILTER not in (None, "PASS", ".") else ""
 
-        for var in sample_vcf:
+                dp = var.format("DP")
+                af = var.format("AF")
+                ad = var.format("AD")
 
-            filter_status = var.FILTER if var.FILTER not in (None, "PASS", ".") else ""
+                sample_dp = dp[0][0] if dp is not None else ""
 
-            dp = var.format("DP")
-            af = var.format("AF")
-            ad = var.format("AD")
+                sample_af = ""
+                if af is not None:
+                    sample_af = af[0][0]
+                elif ad is not None and len(ad[0]) > 1:
+                    ref_count = ad[0][0]
+                    alt_count = ad[0][1]
+                    total = ref_count + alt_count
+                    if total > 0:
+                        sample_af = alt_count / total
 
-            sample_dp = dp[0][0] if dp is not None else ""
+                for alt in var.ALT:
+                    jobs.append({
+                        "chrom": strip_chr(var.CHROM),
+                        "pos": var.POS,
+                        "ref": var.REF,
+                        "alt": alt,
+                        "filter": filter_status,
+                        "sample_dp": sample_dp,
+                        "sample_af": sample_af
+                    })
 
-            sample_af = ""
-            if af is not None:
-                sample_af = af[0][0]
-            elif ad is not None and len(ad[0]) > 1:
-                ref_count = ad[0][0]
-                alt_count = ad[0][1]
-                total = ref_count + alt_count
-                if total > 0:
-                    sample_af = alt_count / total
+            start = time.time()
 
-            for alt in var.ALT:
-                jobs.append({
-                    "chrom": strip_chr(var.CHROM),
-                    "pos": var.POS,
-                    "ref": var.REF,
-                    "alt": alt,
-                    "filter": filter_status,
-                    "sample_dp": sample_dp,
-                    "sample_af": sample_af
-                })
+            with Pool(args.threads, initializer=init_worker,
+                      initargs=(args.gnomad_vcf, args.cosmic_tsv, config)) as pool:
 
-        print(f"[INFO] Total variants: {len(jobs)}")
-        print("[INFO] Starting classification...\n")
+                for result in pool.imap(process_variant, jobs, chunksize=200):
+                    writer.writerow(result)
 
-        start = time.time()
+            elapsed = round(time.time() - start, 2)
 
-        with Pool(args.threads, initializer=init_worker,
-                  initargs=(args.gnomad_vcf, args.cosmic_tsv, config)) as pool:
+        log(f"Completed successfully in {elapsed} seconds")
+        sys.exit(0)
 
-            for result in pool.imap(process_variant, jobs, chunksize=200):
-                writer.writerow(result)
-
-        elapsed = round(time.time() - start, 2)
-
-    print("\n========================================")
-    print("Completed successfully.")
-    print(f"Output written to: {args.output}")
-    print(f"Elapsed time: {elapsed} seconds")
-    print("========================================\n")
+    except Exception as e:
+        log(f"ERROR: {str(e)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
